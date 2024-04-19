@@ -11,13 +11,15 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
-#define BUFFER_SIZE 16384 * 4
+#define BUFFER_SIZE 65536
 #define MASK_LEN 59
 #define OUTPUT_SIZE 966
 #define B_SIZE OUTPUT_SIZE + (MASK_LEN - 1)
 #define BLOCK_SIZE 512
-#define FFT_SIZE 16384 * 4
+#define FFT_SIZE 32768
 int *buffer, *buffer_out;
+int millisecondSum = 0;
+int counter = 0;
 __global__ void convolutionKernel(int* input, int* output);
 __global__ void convolutionKernelOptimized(int* input, int* output);
 __global__ void DFT_kernel(int* input, cuFloatComplex* output);
@@ -41,6 +43,7 @@ void clear_stdin() {
   }
 }
 void convolution() {
+  counter++;
   int *input_d, *output_d;
   checkCudaErrors(cudaMalloc(&input_d, BUFFER_SIZE * sizeof(int)));
   checkCudaErrors(cudaMemcpy(input_d, buffer, BUFFER_SIZE * sizeof(int),
@@ -58,34 +61,58 @@ void convolution() {
   cudaEventSynchronize(stop);
   float milliseconds = 0;
   cudaEventElapsedTime(&milliseconds, start, stop);
-  fprintf(stderr, "Milliseconds for Kernel: %f", milliseconds);
+  // fprintf(stderr, "Milliseconds for Kernel: %f", milliseconds);
+  millisecondSum += milliseconds;
+  if (counter == 5) {
+    millisecondSum = millisecondSum / (5);
+    float gflops = (2.0f * BUFFER_SIZE * MASK_LEN) / milliseconds / 1e6;
+    fprintf(stderr, "GFLOPS for Convolution Kernel: %f\n", gflops);
+    counter = 0;
+    millisecondSum = 0;
+  }
   checkCudaErrors(cudaMemcpy(buffer_out, output_d, BUFFER_SIZE * sizeof(int),
                              cudaMemcpyDeviceToHost));
   checkCudaErrors(cudaFree(input_d));
   checkCudaErrors(cudaFree(output_d));
 }
 void dft() {
+  counter++;
   cuFloatComplex* dftinput_d;
   int *input_d, *output_d;
+  // allocate memory for buffer of audio
   checkCudaErrors(cudaMalloc(&input_d, BUFFER_SIZE * sizeof(int)));
+  // samples copy buffer to device memory
   checkCudaErrors(cudaMemcpy(input_d, buffer, BUFFER_SIZE * sizeof(int),
                              cudaMemcpyHostToDevice));
+  // allocate device memory for output
   checkCudaErrors(cudaMalloc(&output_d, BUFFER_SIZE * sizeof(int)));
+  // allocate memory for DFT points
   checkCudaErrors(cudaMalloc(&dftinput_d, FFT_SIZE * sizeof(cuFloatComplex)));
+  // initialize block dim3
   dim3 dimBlock_input(BLOCK_SIZE);
-  dim3 dimGrid(FFT_SIZE / BLOCK_SIZE);
+  // each thread responsible for computing one dft point, therefore launch
+  // enough threads for FFT_SIZE
+  dim3 dimGrid((FFT_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE);
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
   cudaEventRecord(start, NULL);
   DFT_kernel<<<dimGrid, dimBlock_input>>>(input_d, dftinput_d);
-  dim3 dimGridInverse(BUFFER_SIZE / BLOCK_SIZE);
+  dim3 dimGridInverse((BUFFER_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE);
   IDFT_kernel<<<dimGridInverse, dimBlock_input>>>(dftinput_d, output_d);
   cudaEventRecord(stop, NULL);
   cudaEventSynchronize(stop);
   float milliseconds = 0;
   cudaEventElapsedTime(&milliseconds, start, stop);
-  fprintf(stderr, "Milliseconds for Kernel: %f", milliseconds);
+  // fprintf(stderr, "Milliseconds for DFT Kernel: %f", milliseconds);
+  millisecondSum += milliseconds;
+  if (counter == 5) {
+    millisecondSum = millisecondSum / (5);
+    float gflops = (4.0f * BUFFER_SIZE * FFT_SIZE) / milliseconds / 1e6;
+    fprintf(stderr, "GFLOPS for DFT Kernel: %f\n", gflops);
+    counter = 0;
+    millisecondSum = 0;
+  }
   checkCudaErrors(cudaMemcpy(buffer_out, output_d, BUFFER_SIZE * sizeof(int),
                              cudaMemcpyDeviceToHost));
   checkCudaErrors(cudaFree(dftinput_d));
@@ -111,11 +138,13 @@ __global__ void convolutionKernelOptimized(int* input, int* output) {
   __shared__ int input_shared[B_SIZE];
   int output_index = blockIdx.x * OUTPUT_SIZE + threadIdx.x;
   int input_index = output_index - (MASK_LEN / 2);
-  float shift_amount = 2.0f * M_PI * 500.0f / 44100;
-  cuFloatComplex shift = make_cuFloatComplex(cos(shift_amount * output_index),
-                                             sin(shift_amount * output_index));
+  // float shift_amount = 2.0f * M_PI * 500.0f / 44100;
+  // cuFloatComplex shift = make_cuFloatComplex(cos(shift_amount *
+  // output_index),
+  //                                            sin(shift_amount *
+  //                                            output_index));
   if (input_index > -1 && input_index < BUFFER_SIZE) {
-    input_shared[threadIdx.x] = input[input_index] * shift.x;
+    input_shared[threadIdx.x] = input[input_index];  // * shift.x;
   } else {
     input_shared[threadIdx.x] = 0;
   }
@@ -137,7 +166,7 @@ __global__ void DFT_kernel(int* input, cuFloatComplex* output) {
   float c = -2 * M_PI * k / BUFFER_SIZE;
   cuFloatComplex sum = make_cuFloatComplex(0, 0);
   for (int p = 0; p < BUFFER_SIZE / BLOCK_SIZE; p++) {
-    input_shared[threadIdx.x] = input[p * BLOCK_SIZE + threadIdx.x];
+    input_shared[threadIdx.x] = input[(p * BLOCK_SIZE) + threadIdx.x];
     __syncthreads();
     for (int n = 0; n < BLOCK_SIZE; n++) {
       float imag, real;
@@ -147,12 +176,11 @@ __global__ void DFT_kernel(int* input, cuFloatComplex* output) {
     }
     __syncthreads();
   }
-  output[k] = sum;
-  // output_time[k] =
-  // int(sqrt((output[k].x * output[k].x) + (output[k].y * output[k].y)));
-#if 0 
-if ((k * 44100) / BUFFER_SIZE < 6174) { output[k] = sum; }
-  else {
+  // output[k] = sum;D
+#if 1
+  if ((k * 44100) / FFT_SIZE > 3000) {
+    output[k] = sum;
+  } else {
     output[k] = make_cuFloatComplex(0, 0);
   }
 #endif
@@ -161,7 +189,7 @@ __global__ void IDFT_kernel(cuFloatComplex* input, int* output) {
   __shared__ cuFloatComplex input_shared[BLOCK_SIZE];
   int k = blockIdx.x * blockDim.x + threadIdx.x;
   float c = 2 * M_PI * k / FFT_SIZE;
-  int sum = 0;
+  float sum = 0;
   for (int p = 0; p < FFT_SIZE / BLOCK_SIZE; p++) {
     input_shared[threadIdx.x] = input[p * BLOCK_SIZE + threadIdx.x];
     __syncthreads();
@@ -172,7 +200,7 @@ __global__ void IDFT_kernel(cuFloatComplex* input, int* output) {
     }
     __syncthreads();
   }
-  output[k] = sum / FFT_SIZE;
+  output[k] = int(sum / FFT_SIZE);
 }
 int main() {
   signal(SIGINT, handle_signal);
@@ -180,26 +208,26 @@ int main() {
   checkCudaErrors(cudaMallocHost((void**)&buffer, buffer_size));
   checkCudaErrors(cudaMallocHost((void**)&buffer_out, buffer_size));
   double mask_host[] = {
-      0.000000000000000000,  0.000004438834203373,  0.000049053082052918,
-      -0.000015130777575385, -0.000229225590281534, -0.000048279893872748,
-      0.000581178040493617,  0.000326679950226058,  -0.001107313250291415,
-      -0.001027132488276441, 0.001720767967129273,  0.002409735576127541,
-      -0.002184047527103399, -0.004739632421046886, 0.002055147463495010,
-      0.008208556378427059,  -0.000653542275366089, -0.012845447832394764,
-      -0.002965965598441678, 0.018445807535328835,  0.010104312716340521,
-      -0.024549571108526527, -0.022821285652037081, 0.030485959851263816,
-      0.045627485282245014,  -0.035483947448544301, -0.094461757802380739,
-      0.038825196141212139,  0.314286136325509613,  0.460003649044168850,
-      0.314286136325509613,  0.038825196141212139,  -0.094461757802380739,
-      -0.035483947448544294, 0.045627485282245007,  0.030485959851263827,
-      -0.022821285652037091, -0.024549571108526524, 0.010104312716340521,
-      0.018445807535328852,  -0.002965965598441680, -0.012845447832394771,
-      -0.000653542275366089, 0.008208556378427068,  0.002055147463495013,
-      -0.004739632421046888, -0.002184047527103402, 0.002409735576127543,
-      0.001720767967129272,  -0.001027132488276442, -0.001107313250291414,
-      0.000326679950226057,  0.000581178040493616,  -0.000048279893872748,
-      -0.000229225590281534, -0.000015130777575385, 0.000049053082052918,
-      0.000004438834203373,  0.000000000000000000,
+      0.000000000000000000,  -0.000012033708518804, -0.000027135447534361,
+      0.000058157163173842,  0.000229216710532700,  0.000185570216202303,
+      -0.000321499191608881, -0.000885631478862312, -0.000537999764379554,
+      0.001027092699182624,  0.002341847097367069,  0.001151243636007275,
+      -0.002598060365520312, -0.005145182314934716, -0.002055067851121594,
+      0.005720247141516842,  0.010080909127449795,  0.003200725121983794,
+      -0.011538034732601451, -0.018445092980999400, -0.004446637242013353,
+      0.022402476943542249,  0.033286906592325048,  0.005581436075138684,
+      -0.045625717763144058, -0.066643169632041310, -0.006379031058612831,
+      0.131810456024836181,  0.277589245940945584,  0.339989526083377847,
+      0.277589245940945639,  0.131810456024836181,  -0.006379031058612831,
+      -0.066643169632041310, -0.045625717763144058, 0.005581436075138686,
+      0.033286906592325062,  0.022402476943542242,  -0.004446637242013354,
+      -0.018445092980999413, -0.011538034732601456, 0.003200725121983796,
+      0.010080909127449795,  0.005720247141516848,  -0.002055067851121598,
+      -0.005145182314934718, -0.002598060365520316, 0.001151243636007277,
+      0.002341847097367068,  0.001027092699182625,  -0.000537999764379553,
+      -0.000885631478862312, -0.000321499191608881, 0.000185570216202303,
+      0.000229216710532700,  0.000058157163173842,  -0.000027135447534361,
+      -0.000012033708518804, 0.000000000000000000,
   };
   checkCudaErrors(
       cudaMemcpyToSymbol(mask, mask_host, MASK_LEN * sizeof(double)));
@@ -223,7 +251,7 @@ int main() {
         }
       }
     }
-    convolution();
+    dft();
     printf("RDY\n");
     fflush(stdout);
     for (int i = 0; i < BUFFER_SIZE; i++) {

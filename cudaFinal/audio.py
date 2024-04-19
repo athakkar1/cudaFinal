@@ -1,12 +1,12 @@
 import pyaudio
 import subprocess
 import array
-buffer_size = 16384*4
+buffer_size = 65536
 # Open the C binary
 c_program = subprocess.Popen('audio.exe', stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 
 p = pyaudio.PyAudio()
-input_stream = p.open(format=pyaudio.paInt32, channels=1, rate=44100, input=True, frames_per_buffer=16384*4)
+input_stream = p.open(format=pyaudio.paInt32, channels=1, rate=44100, input=True, frames_per_buffer=65536)
 output_stream = p.open(format=pyaudio.paInt32, channels=1, rate=44100, output=True)
 
 while True:
@@ -16,6 +16,7 @@ while True:
 
     # Convert the bytes to an array of 16-bit signed integers
     data_int16 = array.array('i', data_bytes)
+    #print(data_int16)
 
     # Send a ready signal to the C program
     print("Gonna Print")
